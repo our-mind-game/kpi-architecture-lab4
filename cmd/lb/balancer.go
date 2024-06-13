@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -35,6 +36,56 @@ func scheme() string {
 		return "https"
 	}
 	return "http"
+}
+
+type LoadBalancer struct {
+	healthChecker *HealthChecker
+}
+
+func (lb *LoadBalancer) CheckServers() {
+	for {
+		lb.healthChecker.CheckAllServers()
+		time.Sleep(10 * time.Second)
+	}
+}
+
+func (lb *LoadBalancer) GetServerIndex(reqUrl string) int {
+	h := fnv.New32a()
+	h.Write([]byte(reqUrl))
+	healthyServers := lb.healthChecker.GetHealthyServers()
+	return int(h.Sum32() % uint32(len(healthyServers)))
+}
+
+func (lb *LoadBalancer) GetAppropriateServer(urlPath string) string {
+	healthyServers := lb.healthChecker.GetHealthyServers()
+
+	if len(healthyServers) == 0 {
+		log.Println("No servers available")
+		return ""
+	}
+
+	return healthyServers[lb.GetServerIndex(urlPath)]
+}
+
+type HealthChecker struct {
+	serverHealthStatus map[string]bool
+	health             func(dst string) bool
+}
+
+func (hc *HealthChecker) CheckAllServers() {
+	for _, server := range serversPool {
+		hc.serverHealthStatus[server] = hc.health(server)
+	}
+}
+
+func (hc *HealthChecker) GetHealthyServers() []string {
+	var healthyServers []string
+	for _, server := range serversPool {
+		if hc.serverHealthStatus[server] {
+			healthyServers = append(healthyServers, server)
+		}
+	}
+	return healthyServers
 }
 
 func health(dst string) bool {
@@ -87,19 +138,20 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 func main() {
 	flag.Parse()
 
-	// TODO: Використовуйте дані про стан сервреа, щоб підтримувати список тих серверів, яким можна відправляти ззапит.
-	for _, server := range serversPool {
-		server := server
-		go func() {
-			for range time.Tick(10 * time.Second) {
-				log.Println(server, health(server))
-			}
-		}()
+	healthChecker := &HealthChecker{
+		serverHealthStatus: map[string]bool{},
+		health:             health,
 	}
 
+	balancer := &LoadBalancer{
+		healthChecker: healthChecker,
+	}
+
+	go balancer.CheckServers()
+
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: Рееалізуйте свій алгоритм балансувальника.
-		forward(serversPool[0], rw, r)
+		server := balancer.GetAppropriateServer(r.URL.Path)
+		forward(server, rw, r)
 	}))
 
 	log.Println("Starting load balancer...")
